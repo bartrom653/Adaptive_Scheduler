@@ -1,0 +1,39 @@
+# ---- Linux Kernel Module build artifacts ----
+
+# Об'єктні файли
+*.o
+*.ko
+*.ko.cmd
+*.mod.o
+*.mod.c
+*.mod
+*.cmd
+
+# Порядок модулів і таблиці символів
+modules.order
+Module.symvers
+Module.markers
+Module.symvers.cmd
+Module.markers.cmd
+
+# Каталог .tmp та .cache
+.tmp*
+.cache*
+
+# Файли автогенерації ядра
+*.order
+*.symtypes
+*.dwo
+*.d
+*.cmd
+
+# Інше
+*.mod.cmd
+.*.o.cmd
+.*.ko.cmd
+.*.mod.o.cmd
+
+# ---- CLion files ----
+.idea/
+cmake-build*/
+out/
