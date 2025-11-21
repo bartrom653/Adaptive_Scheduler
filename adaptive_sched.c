@@ -11,11 +11,13 @@
 #include <linux/sched/loadavg.h>
 #include <linux/sched/cputime.h>
 #include <linux/tick.h>
+#include <linux/cpumask.h>    // for_each_online_cpu
+#include <linux/smp.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Roman Bartusevych");
 MODULE_DESCRIPTION("Adaptive CPU scheduling kernel module (sysfs + real CPU load + PID control)");
-MODULE_VERSION("0.4");
+MODULE_VERSION("0.5");
 
 /*
  * ----------------------
@@ -23,27 +25,29 @@ MODULE_VERSION("0.4");
  * ----------------------
  */
 
-// Boost level (0..3), controlled from userspace via boost_level sysfs attribute
+// Boost level (0..3), controlled via sysfs "boost_level"
 static int boost_level = 0;
 
-// Current CPU load (0..100%), read-only for userspace
+// Average CPU load across all online CPUs (0..100), read-only via sysfs
 static int current_load = 0;
 
-// Target process that will be controlled by this module (0 = not set)
+// Maximum per-CPU load among all online CPUs (0..100), read-only via sysfs
+static int max_load = 0;
+
+// Target process ID that will be controlled by this module
 static pid_t target_pid = 0;
 
-// Work item that periodically updates current_load
+// Work item that periodically updates load metrics
 static struct delayed_work load_work;
 
-// Previous values used for CPU load delta calculations
-static u64 prev_idle = 0;
-static u64 prev_total = 0;
+// Previous values used for per-CPU load delta calculations
+static u64 prev_idle[NR_CPUS];
+static u64 prev_total[NR_CPUS];
 
 /*
  * ----------------------
- * Helper: map boost_level -> nice
+ * Helper: map boost_level -> nice value
  * ----------------------
- *
  *  boost_level = 0 -> nice = 0   (default priority)
  *  boost_level = 1 -> nice = -2  (slightly increased priority)
  *  boost_level = 2 -> nice = -5  (higher priority)
@@ -53,12 +57,9 @@ static u64 prev_total = 0;
 static int boost_to_nice(int boost)
 {
     switch (boost) {
-    case 0:
-        return 0;
-    case 1:
-        return -2;
-    case 2:
-        return -5;
+    case 0: return 0;
+    case 1: return -2;
+    case 2: return -5;
     case 3:
     default:
         return -10;
@@ -69,8 +70,7 @@ static int boost_to_nice(int boost)
  * ----------------------
  * Helper: compute real CPU load (%) using kernel cpustat
  * ----------------------
- *
- * Method: compare per-CPU usage counters since the last sample.
+ * Method: compare per-CPU usage counters since last sample.
  * CPU load = (busy_time / total_time) * 100
  */
 
@@ -80,6 +80,9 @@ static int get_cpu_load(int cpu)
     u64 user, nice, system, idle, iowait, irq, softirq, steal;
     u64 idle_all, total;
     u64 diff_idle, diff_total;
+
+    if (cpu >= NR_CPUS)
+        return 0;
 
     kcpustat_ptr = &kcpustat_cpu(cpu);
 
@@ -95,33 +98,30 @@ static int get_cpu_load(int cpu)
     idle_all = idle + iowait;
     total = user + nice + system + idle_all + irq + softirq + steal;
 
-    // First call – just initialize previous values
-    if (prev_total == 0) {
-        prev_total = total;
-        prev_idle  = idle_all;
+    // First measurement for this CPU: initialize
+    if (prev_total[cpu] == 0) {
+        prev_total[cpu] = total;
+        prev_idle[cpu]  = idle_all;
         return 0;
     }
 
-    diff_total = total - prev_total;
-    diff_idle  = idle_all - prev_idle;
+    diff_total = total - prev_total[cpu];
+    diff_idle  = idle_all - prev_idle[cpu];
 
-    prev_total = total;
-    prev_idle  = idle_all;
+    prev_total[cpu] = total;
+    prev_idle[cpu]  = idle_all;
 
     if (diff_total == 0)
         return 0;
 
-    // load% = busy / total * 100
     return (int)(((diff_total - diff_idle) * 100) / diff_total);
 }
 
 /*
  * ----------------------
- * Helper: apply boost_level to target_pid
+ * Helper: apply boost level to target PID
  * ----------------------
- *
- * This function adjusts the nice value of the target process
- * according to the current boost_level.
+ * This adjusts the nice value of the target process.
  */
 
 static void apply_boost_to_target(void)
@@ -178,10 +178,8 @@ static ssize_t boost_store(struct kobject *kobj,
     int val;
 
     if (kstrtoint(buf, 10, &val) == 0) {
-        if (val < 0)
-            val = 0;
-        if (val > 3)
-            val = 3;
+        if (val < 0) val = 0;
+        if (val > 3) val = 3;
 
         boost_level = val;
         pr_info("adaptive_sched: boost_level set to %d\n", boost_level);
@@ -199,7 +197,7 @@ static struct kobj_attribute boost_attr =
 
 /*
  * ----------------------
- * sysfs: current_load (read-only)
+ * sysfs: current_load (average load, read-only)
  * ----------------------
  */
 
@@ -215,7 +213,23 @@ static struct kobj_attribute load_attr =
 
 /*
  * ----------------------
- * sysfs: target_pid (R/W)
+ * sysfs: max_load (maximum per-CPU load, read-only)
+ * ----------------------
+ */
+
+static ssize_t max_load_show(struct kobject *kobj,
+                             struct kobj_attribute *attr,
+                             char *buf)
+{
+    return scnprintf(buf, PAGE_SIZE, "%d\n", max_load);
+}
+
+static struct kobj_attribute max_load_attr =
+    __ATTR(max_load, 0444, max_load_show, NULL);
+
+/*
+ * ----------------------
+ * sysfs: target_pid
  * ----------------------
  */
 
@@ -234,14 +248,14 @@ static ssize_t target_pid_store(struct kobject *kobj,
     pid_t pid_val;
 
     if (kstrtoint(buf, 10, &pid_val) == 0) {
-        if (pid_val < 0)
-            pid_val = 0;
+        if (pid_val < 0) pid_val = 0;
 
         target_pid = pid_val;
         pr_info("adaptive_sched: target_pid set to %d\n", target_pid);
 
         if (target_pid > 0)
             apply_boost_to_target();
+
     } else {
         pr_info("adaptive_sched: invalid value for target_pid\n");
     }
@@ -254,13 +268,14 @@ static struct kobj_attribute target_pid_attr =
 
 /*
  * ----------------------
- * sysfs attributes group
+ * sysfs group
  * ----------------------
  */
 
 static struct attribute *attrs[] = {
     &boost_attr.attr,
     &load_attr.attr,
+    &max_load_attr.attr,
     &target_pid_attr.attr,
     NULL,
 };
@@ -275,20 +290,43 @@ static struct kobject *adaptive_kobj;
  * ----------------------
  * Workqueue: periodic CPU load update
  * ----------------------
+ *
+ * Computes:
+ *  - current_load: average load across all online CPUs
+ *  - max_load: maximum per-CPU load among all online CPUs
  */
 
 static void load_work_func(struct work_struct *work)
 {
-    // For now we measure only CPU0. Later this can be extended to
-    // an average or maximum across all CPUs.
-    current_load = get_cpu_load(0);
+    int cpu;
+    int sum = 0;
+    int cnt = 0;
+    int local_max = 0;
 
-    if (current_load < 0)
+    for_each_online_cpu(cpu) {
+        int load = get_cpu_load(cpu);
+
+        if (load < 0)
+            load = 0;
+        if (load > 100)
+            load = 100;
+
+        sum += load;
+        cnt++;
+
+        if (load > local_max)
+            local_max = load;
+    }
+
+    if (cnt > 0)
+        current_load = sum / cnt;
+    else
         current_load = 0;
-    if (current_load > 100)
-        current_load = 100;
 
-    pr_debug("adaptive_sched: CPU0 load = %d%%\n", current_load);
+    max_load = local_max;
+
+    pr_debug("adaptive_sched: avg_load=%d%%, max_load=%d%%\n",
+             current_load, max_load);
 
     schedule_delayed_work(&load_work, msecs_to_jiffies(500));
 }
