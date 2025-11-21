@@ -1,6 +1,6 @@
 # ---- Linux Kernel Module build artifacts ----
 
-# Об'єктні файли
+# Object files
 *.o
 *.ko
 *.ko.cmd
@@ -9,25 +9,25 @@
 *.mod
 *.cmd
 
-# Порядок модулів і таблиці символів
+# Module order and symbol table
 modules.order
 Module.symvers
 Module.markers
 Module.symvers.cmd
 Module.markers.cmd
 
-# Каталог .tmp та .cache
+# .tmp and .cache directory
 .tmp*
 .cache*
 
-# Файли автогенерації ядра
+# Kernel auto-generation files
 *.order
 *.symtypes
 *.dwo
 *.d
 *.cmd
 
-# Інше
+# Other
 *.mod.cmd
 .*.o.cmd
 .*.ko.cmd
@@ -37,3 +37,9 @@ Module.markers.cmd
 .idea/
 cmake-build*/
 out/
+
+#------ Python vitrual environment files ----
+
+.venv/
+venv/
+ENV/
