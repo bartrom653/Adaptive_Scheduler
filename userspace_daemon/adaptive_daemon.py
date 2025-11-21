@@ -2,7 +2,7 @@
 import time
 import subprocess
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 # Paths to kernel module sysfs interface
 SYSFS_BASE = Path("/sys/kernel/adaptive_sched")
@@ -11,6 +11,14 @@ PATH_MAX_LOAD = SYSFS_BASE / "max_load"
 PATH_BOOST_LEVEL = SYSFS_BASE / "boost_level"
 PATH_TARGET_PID = SYSFS_BASE / "target_pid"
 
+# Paths to /proc and pressure information
+PROC_STAT = Path("/proc/stat")
+PROC_MEMINFO = Path("/proc/meminfo")
+PROC_LOADAVG = Path("/proc/loadavg")
+PROC_PSI_CPU = Path("/proc/pressure/cpu")
+
+
+# ---------- generic helpers ----------
 
 def read_int(path: Path) -> Optional[int]:
     """Read integer value from a sysfs/proc file. Returns None on error."""
@@ -34,12 +42,119 @@ def write_int(path: Path, value: int) -> bool:
         return False
 
 
+# ---------- kernel metrics (from our module) ----------
+
 def get_kernel_metrics() -> Tuple[Optional[int], Optional[int]]:
     """Read current_load and max_load from kernel module."""
     avg_load = read_int(PATH_CURRENT_LOAD)
     max_load = read_int(PATH_MAX_LOAD)
     return avg_load, max_load
 
+
+# ---------- system-level features from /proc ----------
+
+def parse_meminfo() -> Dict[str, Any]:
+    """Return memory usage features: mem_used_pct."""
+    total = None
+    available = None
+    try:
+        with PROC_MEMINFO.open("r") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    total = int(line.split()[1])  # kB
+                elif line.startswith("MemAvailable:"):
+                    available = int(line.split()[1])  # kB
+                if total is not None and available is not None:
+                    break
+    except FileNotFoundError:
+        return {}
+
+    if total is None or available is None or total == 0:
+        return {}
+
+    used_pct = (1.0 - (available / total)) * 100.0
+    return {"mem_used_pct": used_pct}
+
+
+def parse_proc_stat() -> Dict[str, Any]:
+    """Return procs_running and procs_blocked from /proc/stat."""
+    features: Dict[str, Any] = {}
+    try:
+        with PROC_STAT.open("r") as f:
+            for line in f:
+                if line.startswith("procs_running"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        features["procs_running"] = int(parts[1])
+                elif line.startswith("procs_blocked"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        features["procs_blocked"] = int(parts[1])
+                if "procs_running" in features and "procs_blocked" in features:
+                    break
+    except FileNotFoundError:
+        pass
+    return features
+
+
+def parse_loadavg() -> Dict[str, Any]:
+    """Return loadavg1, loadavg5, loadavg15 from /proc/loadavg."""
+    try:
+        with PROC_LOADAVG.open("r") as f:
+            parts = f.read().strip().split()
+        if len(parts) >= 3:
+            return {
+                "loadavg1": float(parts[0]),
+                "loadavg5": float(parts[1]),
+                "loadavg15": float(parts[2]),
+            }
+    except (FileNotFoundError, ValueError):
+        pass
+    return {}
+
+
+def parse_cpu_psi() -> Dict[str, Any]:
+    """
+    Parse CPU pressure from /proc/pressure/cpu.
+
+    We take avg10 for "some" and "full" if available:
+      psi_cpu_some, psi_cpu_full
+    """
+    features: Dict[str, Any] = {}
+    try:
+        with PROC_PSI_CPU.open("r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("some "):
+                    # example: "some avg10=0.00 avg60=0.00 avg300=0.00 total=0"
+                    parts = line.split()
+                    for p in parts:
+                        if p.startswith("avg10="):
+                            features["psi_cpu_some"] = float(
+                                p.split("=", 1)[1].replace(",", ".")
+                            )
+                elif line.startswith("full "):
+                    for p in line.split():
+                        if p.startswith("avg10="):
+                            features["psi_cpu_full"] = float(
+                                p.split("=", 1)[1].replace(",", ".")
+                            )
+    except FileNotFoundError:
+        pass
+    return features
+
+
+def get_system_features() -> Dict[str, Any]:
+    """Collect all system-level features into one dict."""
+    features: Dict[str, Any] = {}
+    features.update(parse_meminfo())
+    features.update(parse_proc_stat())
+    features.update(parse_loadavg())
+    features.update(parse_cpu_psi())
+    return features
+
+
+# ---------- process-level features ----------
 
 def pick_target_pid(min_cpu: float = 5.0) -> Optional[int]:
     """
@@ -51,7 +166,6 @@ def pick_target_pid(min_cpu: float = 5.0) -> Optional[int]:
     - Return the first process with CPU >= min_cpu.
     """
     try:
-        # -e: all processes, -o: output format, --sort=-pcpu: sort by CPU desc
         result = subprocess.run(
             ["ps", "-eo", "pid,comm,pcpu", "--sort=-pcpu"],
             text=True,
@@ -68,7 +182,6 @@ def pick_target_pid(min_cpu: float = 5.0) -> Optional[int]:
 
     header_skipped = False
     for line in lines:
-        # Skip header line
         if not header_skipped:
             header_skipped = True
             continue
@@ -84,11 +197,9 @@ def pick_target_pid(min_cpu: float = 5.0) -> Optional[int]:
         except ValueError:
             continue
 
-        # Ignore very low CPU usage
         if cpu < min_cpu:
             continue
 
-        # Ignore some known system/daemon processes by name
         blacklist_prefixes = (
             "systemd", "kthreadd", "rcu_", "migration", "idle",
             "adaptive_daemon", "gnome-shell", "Xorg"
@@ -116,38 +227,103 @@ def estimate_process_cpu(pid: int) -> Optional[float]:
             return None
         return float(text.replace(",", "."))
     except subprocess.CalledProcessError:
-        # process may have exited
         return None
     except ValueError:
         return None
 
 
+def parse_proc_status(pid: int) -> Dict[str, Any]:
+    """Parse /proc/<pid>/status for memory and threads."""
+    status_path = Path(f"/proc/{pid}/status")
+    features: Dict[str, Any] = {}
+    try:
+        with status_path.open("r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        features["proc_rss_kb"] = int(parts[1])
+                elif line.startswith("VmSize:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        features["proc_vms_kb"] = int(parts[1])
+                elif line.startswith("Threads:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        features["proc_threads"] = int(parts[1])
+    except FileNotFoundError:
+        pass
+    return features
+
+
+def parse_proc_io(pid: int) -> Dict[str, Any]:
+    """Parse /proc/<pid>/io for IO bytes."""
+    io_path = Path(f"/proc/{pid}/io")
+    features: Dict[str, Any] = {}
+    try:
+        with io_path.open("r") as f:
+            for line in f:
+                if line.startswith("read_bytes:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        features["proc_read_bytes"] = int(parts[1])
+                elif line.startswith("write_bytes:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        features["proc_write_bytes"] = int(parts[1])
+    except FileNotFoundError:
+        pass
+    return features
+
+
+def get_process_features(pid: int) -> Dict[str, Any]:
+    """Collect per-process features."""
+    features: Dict[str, Any] = {}
+    features.update(parse_proc_status(pid))
+    features.update(parse_proc_io(pid))
+    return features
+
+
+# ---------- decision logic (placeholder for ML) ----------
+
 def decide_boost_level(avg_load: int,
                        max_load: int,
-                       proc_cpu: Optional[float]) -> int:
+                       proc_cpu: Optional[float],
+                       features: Dict[str, Any]) -> int:
     """
-    Very simple rule-based controller.
+    Very simple rule-based controller, using system + process features.
 
     This is a placeholder for a future ML model.
-    Input features:
-      - avg_load: average system CPU load (%)
-      - max_load: max per-CPU load (%)
-      - proc_cpu: CPU usage of target process (%)
     """
-    # Default to no boost if metrics are invalid
     if avg_load is None or max_load is None:
         return 0
 
-    # Strong boost if system or process is heavily loaded
-    if max_load >= 90 or (proc_cpu is not None and proc_cpu >= 80):
+    mem_used = features.get("mem_used_pct", 0.0)
+    procs_running = features.get("procs_running", 0)
+
+    # Strong boost if:
+    #  - CPU core is fully loaded, or
+    #  - target process is very CPU-heavy, or
+    #  - system is under high memory + runqueue pressure
+    if max_load >= 90 or \
+       (proc_cpu is not None and proc_cpu >= 80) or \
+       (mem_used >= 90 and procs_running >= 8):
         return 3
-    if avg_load >= 70 or (proc_cpu is not None and proc_cpu >= 60):
+
+    if avg_load >= 70 or \
+       (proc_cpu is not None and proc_cpu >= 60) or \
+       (mem_used >= 80 and procs_running >= 6):
         return 2
-    if avg_load >= 40 or (proc_cpu is not None and proc_cpu >= 30):
+
+    if avg_load >= 40 or \
+       (proc_cpu is not None and proc_cpu >= 30) or \
+       (mem_used >= 70 and procs_running >= 4):
         return 1
 
     return 0
 
+
+# ---------- main loop ----------
 
 def main_loop(interval: float = 0.5):
     print("[INFO] Adaptive ML daemon started")
@@ -156,10 +332,9 @@ def main_loop(interval: float = 0.5):
     last_boost_level: Optional[int] = None
 
     while True:
-        # 1) Read kernel metrics
         avg_load, max_load = get_kernel_metrics()
+        sys_features = get_system_features()
 
-        # 2) Decide or update target PID
         if last_target_pid is None:
             pid = pick_target_pid(min_cpu=5.0)
             if pid is not None:
@@ -168,38 +343,56 @@ def main_loop(interval: float = 0.5):
                     print(f"[INFO] target_pid set to {pid}")
             else:
                 print("[INFO] No suitable target PID found (CPU too low)")
-        else:
-            # Check if process is still alive
-            proc_cpu = estimate_process_cpu(last_target_pid)
-            if proc_cpu is None:
-                print(f"[INFO] Previous target PID {last_target_pid} is gone, "
-                      f"resetting target")
-                last_target_pid = None
-                proc_cpu = None
-            else:
-                # 3) Decide boost level based on system and process load
-                boost = decide_boost_level(
-                    avg_load if avg_load is not None else 0,
-                    max_load if max_load is not None else 0,
-                    proc_cpu,
-                )
+                time.sleep(interval)
+                continue
 
-                # 4) Apply boost_level if changed
-                if last_boost_level is None or boost != last_boost_level:
-                    if write_int(PATH_BOOST_LEVEL, boost):
-                        last_boost_level = boost
-                        print(
-                            f"[INFO] boost_level={boost} "
-                            f"(avg={avg_load}%, max={max_load}%, "
-                            f"proc_cpu={proc_cpu:.1f}%, pid={last_target_pid})"
-                        )
-                else:
-                    # Optional: debug spam minimized
-                    print(
-                        f"[DEBUG] No change: boost={boost}, "
-                        f"avg={avg_load}%, max={max_load}%, "
-                        f"proc_cpu={proc_cpu:.1f}%, pid={last_target_pid}"
-                    )
+        proc_cpu = estimate_process_cpu(last_target_pid)
+        if proc_cpu is None:
+            print(f"[INFO] Previous target PID {last_target_pid} is gone, resetting")
+            last_target_pid = None
+            time.sleep(interval)
+            continue
+
+        proc_features = get_process_features(last_target_pid)
+
+        # merged feature set (зручно потім писати у лог/CSV для тренування ML)
+        all_features: Dict[str, Any] = {
+            "avg_load": avg_load,
+            "max_load": max_load,
+            "proc_cpu": proc_cpu,
+            "target_pid": last_target_pid,
+        }
+        all_features.update(sys_features)
+        all_features.update(proc_features)
+
+        boost = decide_boost_level(
+            avg_load if avg_load is not None else 0,
+            max_load if max_load is not None else 0,
+            proc_cpu,
+            all_features,
+        )
+
+        if last_boost_level is None or boost != last_boost_level:
+            if write_int(PATH_BOOST_LEVEL, boost):
+                last_boost_level = boost
+                print(
+                    f"[INFO] boost_level={boost} "
+                    f"(avg={avg_load}%, max={max_load}%, "
+                    f"proc_cpu={proc_cpu:.1f}%, "
+                    f"mem_used={all_features.get('mem_used_pct', 0):.1f}%, "
+                    f"procs_running={all_features.get('procs_running', 0)}, "
+                    f"pid={last_target_pid})"
+                )
+        else:
+            print(
+                f"[DEBUG] No change: boost={boost}, "
+                f"avg={avg_load}%, max={max_load}%, "
+                f"proc_cpu={proc_cpu:.1f}%, "
+                f"mem_used={all_features.get('mem_used_pct', 0):.1f}%, "
+                f"procs_running={all_features.get('procs_running', 0)}, "
+                f"pid={last_target_pid}"
+            )
+
 
         time.sleep(interval)
 
