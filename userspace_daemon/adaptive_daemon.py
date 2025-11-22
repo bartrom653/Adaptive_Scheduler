@@ -165,7 +165,6 @@ def parse_cpu_psi() -> Dict[str, Any]:
             for line in f:
                 line = line.strip()
                 if line.startswith("some "):
-                    # example: "some avg10=0.00 avg60=0.00 avg300=0.00 total=0"
                     parts = line.split()
                     for p in parts:
                         if p.startswith("avg10="):
@@ -376,6 +375,13 @@ def main_loop(interval: float = 0.5):
     print(f"[INFO] Logs will be written to: {LOG_FILE}")
     last_target_pid: Optional[int] = None
     last_boost_level: Optional[int] = None
+    hold_start: Optional[float] = None
+    low_cpu_counter: int = 0
+
+    # Hybrid auto-switch thresholds
+    HOLD_TIME_SEC = 10.0          # мінімальний час утримання PID
+    LOW_CPU_THRESHOLD = 2.0       # нижче 2% вважаємо "спить"
+    LOW_CPU_COUNT_TRIGGER = 4     # кількість послідовних циклів низького CPU
 
     while True:
         avg_load, max_load = get_kernel_metrics()
@@ -387,6 +393,8 @@ def main_loop(interval: float = 0.5):
             if pid is not None:
                 if write_int(PATH_TARGET_PID, pid):
                     last_target_pid = pid
+                    hold_start = time.time()
+                    low_cpu_counter = 0
                     print(f"[INFO] target_pid set to {pid}")
             else:
                 print("[INFO] No suitable target PID found (CPU too low)")
@@ -397,11 +405,61 @@ def main_loop(interval: float = 0.5):
         if proc_cpu is None:
             print(f"[INFO] Previous target PID {last_target_pid} is gone, resetting")
             last_target_pid = None
-            # Optionally reset boost in kernel
             write_int(PATH_BOOST_LEVEL, 0)
             last_boost_level = 0
+            hold_start = None
+            low_cpu_counter = 0
             time.sleep(interval)
             continue
+
+        now = time.time()
+        if hold_start is None:
+            hold_start = now
+
+        # -------------------------
+        # Hybrid auto-switching logic
+        # -------------------------
+
+        # 1) Low CPU detection
+        if proc_cpu < LOW_CPU_THRESHOLD:
+            low_cpu_counter += 1
+        else:
+            low_cpu_counter = 0
+
+        low_cpu_triggered = (low_cpu_counter >= LOW_CPU_COUNT_TRIGGER)
+
+        # 2) High competition detection
+        high_competition = False
+        competing_pid = pick_target_pid(min_cpu=10.0)  # only heavier tasks
+        if competing_pid is not None and competing_pid != last_target_pid:
+            comp_cpu = estimate_process_cpu(competing_pid)
+            if comp_cpu is not None and comp_cpu > proc_cpu + 30.0:
+                high_competition = True
+
+        # 3) Time-based condition:
+        #    якщо процес тримаємо довго, а він слабенький — теж можна переключити
+        time_based_switch = (now - hold_start > HOLD_TIME_SEC and proc_cpu < 5.0)
+
+        should_switch = low_cpu_triggered or high_competition or time_based_switch
+
+        if should_switch:
+            print(
+                f"[INFO] Auto-switching target pid {last_target_pid} "
+                f"(proc_cpu={proc_cpu:.1f}%, "
+                f"low_cpu={low_cpu_triggered}, high_comp={high_competition}, "
+                f"time_based={time_based_switch})"
+            )
+            last_target_pid = None
+            write_int(PATH_BOOST_LEVEL, 0)
+            last_boost_level = 0
+            hold_start = None
+            low_cpu_counter = 0
+            time.sleep(interval)
+            continue
+
+        # -------------------------
+        # Collect process features
+        # -------------------------
 
         proc_features = get_process_features(last_target_pid)
 
@@ -448,7 +506,7 @@ def main_loop(interval: float = 0.5):
         # 4) Log features + boost to CSV (dataset for ML)
         log_row = all_features.copy()
         log_row["boost_level"] = boost
-        log_row["timestamp"] = time.time()
+        log_row["timestamp"] = now
 
         init_log_file(list(log_row.keys()))
         append_log_row(log_row)
