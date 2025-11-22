@@ -39,7 +39,10 @@ cmake-build*/
 out/
 
 #------ Python vitrual environment files ----
-
 .venv/
 venv/
 ENV/
+
+#----- Metrics log
+logs
+.csv

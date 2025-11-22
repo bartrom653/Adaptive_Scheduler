@@ -1,24 +1,59 @@
 #!/usr/bin/env python3
 import time
 import subprocess
+import csv
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
 
+# ----------------------------
 # Paths to kernel module sysfs interface
+# ----------------------------
+
 SYSFS_BASE = Path("/sys/kernel/adaptive_sched")
 PATH_CURRENT_LOAD = SYSFS_BASE / "current_load"
 PATH_MAX_LOAD = SYSFS_BASE / "max_load"
 PATH_BOOST_LEVEL = SYSFS_BASE / "boost_level"
 PATH_TARGET_PID = SYSFS_BASE / "target_pid"
 
+# ----------------------------
 # Paths to /proc and pressure information
+# ----------------------------
+
 PROC_STAT = Path("/proc/stat")
 PROC_MEMINFO = Path("/proc/meminfo")
 PROC_LOADAVG = Path("/proc/loadavg")
 PROC_PSI_CPU = Path("/proc/pressure/cpu")
 
+# ----------------------------
+# Logging (dataset for ML)
+# logs/metrics_log.csv near this script
+# ----------------------------
 
-# ---------- generic helpers ----------
+SCRIPT_DIR = Path(__file__).resolve().parent
+LOG_DIR = SCRIPT_DIR / "logs"
+LOG_FILE = LOG_DIR / "metrics_log.csv"
+
+
+def init_log_file(fieldnames):
+    """Create log directory and CSV file with a header if it does not exist."""
+    LOG_DIR.mkdir(exist_ok=True)
+    if not LOG_FILE.exists():
+        with LOG_FILE.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+        print(f"[INFO] Created new log file: {LOG_FILE}")
+
+
+def append_log_row(row: Dict[str, Any]):
+    """Append one row of metrics to CSV."""
+    with LOG_FILE.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        writer.writerow(row)
+
+
+# ----------------------------
+# Generic helpers
+# ----------------------------
 
 def read_int(path: Path) -> Optional[int]:
     """Read integer value from a sysfs/proc file. Returns None on error."""
@@ -42,7 +77,9 @@ def write_int(path: Path, value: int) -> bool:
         return False
 
 
-# ---------- kernel metrics (from our module) ----------
+# ----------------------------
+# Kernel metrics (from our module)
+# ----------------------------
 
 def get_kernel_metrics() -> Tuple[Optional[int], Optional[int]]:
     """Read current_load and max_load from kernel module."""
@@ -51,7 +88,9 @@ def get_kernel_metrics() -> Tuple[Optional[int], Optional[int]]:
     return avg_load, max_load
 
 
-# ---------- system-level features from /proc ----------
+# ----------------------------
+# System-level features from /proc
+# ----------------------------
 
 def parse_meminfo() -> Dict[str, Any]:
     """Return memory usage features: mem_used_pct."""
@@ -154,7 +193,9 @@ def get_system_features() -> Dict[str, Any]:
     return features
 
 
-# ---------- process-level features ----------
+# ----------------------------
+# Process-level features
+# ----------------------------
 
 def pick_target_pid(min_cpu: float = 5.0) -> Optional[int]:
     """
@@ -284,7 +325,9 @@ def get_process_features(pid: int) -> Dict[str, Any]:
     return features
 
 
-# ---------- decision logic (placeholder for ML) ----------
+# ----------------------------
+# Decision logic (placeholder for ML)
+# ----------------------------
 
 def decide_boost_level(avg_load: int,
                        max_load: int,
@@ -323,11 +366,14 @@ def decide_boost_level(avg_load: int,
     return 0
 
 
-# ---------- main loop ----------
+# ----------------------------
+# Main loop
+# ----------------------------
 
 def main_loop(interval: float = 0.5):
     print("[INFO] Adaptive ML daemon started")
     print(f"[INFO] Using sysfs base: {SYSFS_BASE}")
+    print(f"[INFO] Logs will be written to: {LOG_FILE}")
     last_target_pid: Optional[int] = None
     last_boost_level: Optional[int] = None
 
@@ -335,6 +381,7 @@ def main_loop(interval: float = 0.5):
         avg_load, max_load = get_kernel_metrics()
         sys_features = get_system_features()
 
+        # 1) Choose or validate target PID
         if last_target_pid is None:
             pid = pick_target_pid(min_cpu=5.0)
             if pid is not None:
@@ -350,12 +397,15 @@ def main_loop(interval: float = 0.5):
         if proc_cpu is None:
             print(f"[INFO] Previous target PID {last_target_pid} is gone, resetting")
             last_target_pid = None
+            # Optionally reset boost in kernel
+            write_int(PATH_BOOST_LEVEL, 0)
+            last_boost_level = 0
             time.sleep(interval)
             continue
 
         proc_features = get_process_features(last_target_pid)
 
-        # merged feature set (зручно потім писати у лог/CSV для тренування ML)
+        # Merge all features into a single dict
         all_features: Dict[str, Any] = {
             "avg_load": avg_load,
             "max_load": max_load,
@@ -365,6 +415,7 @@ def main_loop(interval: float = 0.5):
         all_features.update(sys_features)
         all_features.update(proc_features)
 
+        # 2) Decide boost level (rule-based for now)
         boost = decide_boost_level(
             avg_load if avg_load is not None else 0,
             max_load if max_load is not None else 0,
@@ -372,6 +423,7 @@ def main_loop(interval: float = 0.5):
             all_features,
         )
 
+        # 3) Apply boost if changed
         if last_boost_level is None or boost != last_boost_level:
             if write_int(PATH_BOOST_LEVEL, boost):
                 last_boost_level = boost
@@ -393,6 +445,13 @@ def main_loop(interval: float = 0.5):
                 f"pid={last_target_pid}"
             )
 
+        # 4) Log features + boost to CSV (dataset for ML)
+        log_row = all_features.copy()
+        log_row["boost_level"] = boost
+        log_row["timestamp"] = time.time()
+
+        init_log_file(list(log_row.keys()))
+        append_log_row(log_row)
 
         time.sleep(interval)
 
