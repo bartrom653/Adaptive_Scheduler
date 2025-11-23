@@ -1,305 +1,199 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================
-#  CONFIG: ПІДЛАШТУЙ ПІД СЕБЕ
-# ============================
+# ============================================
+# CONFIG: adjust as needed
+# ============================================
 
-# Каталог з твоїм kernel-модулем (де Makefile)
 KERNEL_MODULE_DIR="$HOME/Projects/adaptive_sched/kernel_module"
-
-# Тимчасовий файл для IO-навантаження
 IO_TEST_FILE="/tmp/adaptive_io_test.bin"
 
-# Команди для реальних програм (ЗМІНИ якщо інші)
-BROWSER_CMD="firefox"            # або brave / chromium / google-chrome-stable
-IDE_CMD="clion"                  # або pycharm / idea / code
-TERMINAL_CMD="kitty"             # або alacritty / konsole / gnome-terminal
-TELEGRAM_CMD="telegram-desktop"  # якщо нема — можеш залишити як є, сценарії просто попереджатимуть
+ITER_KERNEL_BUILD=6
+ITER_CPU_PYTHON=8
+ITER_IO_DD=6
+ITER_APP_OPEN_CLOSE=6
+ITER_MIXED_PARALLEL=6
 
-# Скільки разів проганяти ВЕСЬ набір сценаріїв
-# 1 раунд ≈ 40–60 хв, залежить від того, як активно ти клацаєш
-ROUNDS=2
+APP_START_SLEEP=4
+APP_CLOSE_SLEEP=2
+SHORT_SLEEP=1
 
-# ============================
-#  ДОПОМІЖНІ ФУНКЦІЇ
-# ============================
+CMD_BROWSER="google-chrome-stable"
+CMD_TELEGRAM="Telegram"
+CMD_PYCHARM="pycharm"
+CMD_CLION="clion"
+CMD_EASYEFFECTS="easyeffects"
+CMD_VOLUME_CTRL="pavucontrol"
+CMD_ONLYOFFICE="onlyoffice-desktopeditors"
+CMD_THUNAR="thunar"
+CMD_VLC="vlc"
+CMD_OBS="obs"
 
-run_if_exists() {
+# ============================================
+# Helpers
+# ============================================
+
+run_if_exists_bg() {
     local cmd="$1"
     shift || true
     if command -v "$cmd" >/dev/null 2>&1; then
-        "$cmd" "$@" &
+        "$cmd" "$@" >/dev/null 2>&1 &
     else
-        echo "[WARN] Command '$cmd' not found, skipping"
+        echo "[WARN] '$cmd' not found"
     fi
 }
 
 kill_if_exists() {
     local pattern="$1"
     pkill -f "$pattern" 2>/dev/null || true
+
+    # Chrome-specific fallback
+    if [[ "$pattern" == *"chrome"* ]]; then
+        pkill -f "chrome" 2>/dev/null || true
+    fi
 }
 
-# ============================
-#  БАЗОВІ СЦЕНАРІЇ
-# ============================
+# ============================================
+# Scenarios
+# ============================================
 
-scenario_idle_short() {
-    echo "[SCENARIO] IDLE_SHORT: 60s повний простій"
-    sleep 60
-}
+scenario_kernel_build_loop() {
+    echo "[SCENARIO] KERNEL_BUILD_LOOP ($ITER_KERNEL_BUILD)"
+    [[ -d "$KERNEL_MODULE_DIR" ]] || { echo "[WARN] Kernel dir missing"; return; }
 
-scenario_idle_long() {
-    echo "[SCENARIO] IDLE_LONG: 180s простій (імітація читання/AFK)"
-    sleep 180
-}
-
-scenario_browser_browsing() {
-    echo "[SCENARIO] BROWSER_BROWSING: браузер, 3 хв ручної активності"
-    run_if_exists "$BROWSER_CMD"
-    echo "  > Поклікай сайти, YouTube, документацію (3 хв)..."
-    sleep 180
-    kill_if_exists "$BROWSER_CMD"
-}
-
-scenario_ide_open_project() {
-    echo "[SCENARIO] IDE_OPEN_PROJECT: відкриття IDE (індексація проєкту, 2 хв)"
-    run_if_exists "$IDE_CMD"
-    echo "  > Відкрий свій проєкт, дай IDE проіндексувати, трохи попрацюй (2 хв)..."
-    sleep 120
-    kill_if_exists "$IDE_CMD"
-}
-
-scenario_kernel_build() {
-    echo "[SCENARIO] KERNEL_BUILD: збірка kernel-модуля (CPU + IO)"
-    if [ -d "$KERNEL_MODULE_DIR" ]; then
-        pushd "$KERNEL_MODULE_DIR" >/dev/null || true
+    for ((i=1; i<=ITER_KERNEL_BUILD; i++)); do
+        echo "  [BUILD] $i / $ITER_KERNEL_BUILD"
+        pushd "$KERNEL_MODULE_DIR" >/dev/null || return
         make clean >/dev/null 2>&1 || true
-        make -j"$(nproc)" || true
-        popd >/dev/null || true
-    else
-        echo "[WARN] KERNEL_MODULE_DIR не існує: $KERNEL_MODULE_DIR"
-    fi
-    sleep 30
+        make -j"$(nproc)" >/dev/null 2>&1 || true
+        popd >/dev/null || return
+        sleep "$SHORT_SLEEP"
+    done
 }
 
-scenario_cpu_stress() {
-    echo "[SCENARIO] CPU_STRESS: stress-ng 90s (чисте CPU навантаження)"
-    if command -v stress-ng >/dev/null 2>&1; then
-        stress-ng --cpu 4 --timeout 90s --metrics-brief || true
-    else
-        echo "[WARN] stress-ng не встановлений, пропускаю CPU STRESS"
-        sleep 90
-    fi
-}
-
-scenario_io_stress() {
-    echo "[SCENARIO] IO_STRESS: послідовний запис ~1ГБ на диск"
-    dd if=/dev/zero of="$IO_TEST_FILE" bs=16M count=64 oflag=direct 2>/dev/null || true
-    sync || true
-    sleep 20
-    rm -f "$IO_TEST_FILE" || true
-}
-
-scenario_python_mixed() {
-    echo "[SCENARIO] PYTHON_MIXED: Python з CPU+RAM+паузи (2 хв)"
-    python3 - << 'EOF'
-import math
-import time
-import random
-
-data = [random.random() for _ in range(500_000)]
-start = time.time()
-while time.time() - start < 120:
-    s = 0.0
-    for x in data:
-        s += math.sqrt(x)
-    time.sleep(0.05)
+scenario_cpu_python_loop() {
+    echo "[SCENARIO] CPU_PYTHON_LOOP ($ITER_CPU_PYTHON)"
+    for ((i=1; i<=ITER_CPU_PYTHON; i++)); do
+        echo "  [PYTHON] $i / $ITER_CPU_PYTHON"
+        python3 - << 'EOF' >/dev/null 2>&1
+import math, random
+N = 5_000_000
+s = 0.0
+for _ in range(N):
+    x = random.random()
+    s += math.sqrt(x)
 EOF
-    sleep 10
+        sleep "$SHORT_SLEEP"
+    done
 }
 
-scenario_terminal_activity() {
-    echo "[SCENARIO] TERMINAL_ACTIVITY: термінал + легкі команди (2 хв)"
-    run_if_exists "$TERMINAL_CMD"
-    echo "  > Відкрий у терміналі кілька вікон/вкладок, зроби git status, ls, htop і т.п. (2 хв)..."
-    sleep 120
-    kill_if_exists "$TERMINAL_CMD"
+scenario_io_dd_loop() {
+    echo "[SCENARIO] IO_DD_LOOP ($ITER_IO_DD)"
+    for ((i=1; i<=ITER_IO_DD; i++)); do
+        echo "  [DD] $i / $ITER_IO_DD"
+        dd if=/dev/zero of="$IO_TEST_FILE" bs=16M count=64 oflag=direct >/dev/null 2>&1 || true
+        sync || true
+        rm -f "$IO_TEST_FILE" || true
+        sleep "$SHORT_SLEEP"
+    done
 }
 
-scenario_telegram_chat() {
-    echo "[SCENARIO] TELEGRAM_CHAT: запуск Telegram (фонова активність, 2 хв)"
-    if [ -n "${TELEGRAM_CMD:-}" ]; then
-        run_if_exists "$TELEGRAM_CMD"
-        echo "  > Попиши трохи в Telegram / прочитай чати (2 хв)..."
-        sleep 120
-        kill_if_exists "$TELEGRAM_CMD"
-    else
-        echo "[INFO] TELEGRAM_CMD не заданий, пропускаю"
-        sleep 60
-    fi
-}
+open_close_app_loop() {
+    local cmd="$1"
+    local iters="$2"
 
-scenario_browser_video() {
-    echo "[SCENARIO] BROWSER_VIDEO: браузер + відео/YouTube (3 хв)"
-    run_if_exists "$BROWSER_CMD"
-    echo "  > Відкрий відео/стрім у браузері, подивись 3 хв..."
-    sleep 180
-    kill_if_exists "$BROWSER_CMD"
-}
-
-scenario_cooldown_idle() {
-    echo "[SCENARIO] COOLDOWN_IDLE: 90s спокою після навантажень"
-    sleep 90
-}
-
-# ============================
-#  ПАРАЛЕЛЬНІ СЦЕНАРІЇ
-# ============================
-
-scenario_parallel_browsing_ide() {
-    echo "[SCENARIO] PARALLEL_BROWSING_IDE: Browser + IDE (3 хв)"
-    run_if_exists "$BROWSER_CMD"
-    run_if_exists "$IDE_CMD"
-    sleep 10
-    echo "  > Паралельно працюй в IDE і браузері (3 хв)..."
-    sleep 180
-    kill_if_exists "$BROWSER_CMD"
-    kill_if_exists "$IDE_CMD"
-}
-
-scenario_parallel_cpu_video() {
-    echo "[SCENARIO] PARALLEL_CPU_VIDEO: CPU_STRESS + Video in Browser (2 хв)"
-    run_if_exists "$BROWSER_CMD"
-    sleep 8
-    if command -v stress-ng >/dev/null 2>&1; then
-        stress-ng --cpu 4 --timeout 120s --metrics-brief || true &
-    else
-        echo "[WARN] stress-ng не встановлений, пропускаю CPU STRESS частину"
-    fi
-    echo "  > Відкрий відео на YouTube і дивись 2 хв..."
-    sleep 120
-    kill_if_exists "$BROWSER_CMD"
-}
-
-scenario_parallel_build_telegram() {
-    echo "[SCENARIO] PARALLEL_BUILD_TELEGRAM: Kernel build + Telegram + Terminal (2–3 хв)"
-    run_if_exists "$TELEGRAM_CMD"
-    run_if_exists "$TERMINAL_CMD"
-    sleep 5
-
-    if [ -d "$KERNEL_MODULE_DIR" ]; then
-        pushd "$KERNEL_MODULE_DIR" >/dev/null || true
-        make clean >/dev/null 2>&1 || true
-        make -j"$(nproc)" || true &
-        popd >/dev/null || true
-    else
-        echo "[WARN] KERNEL_MODULE_DIR не існує: $KERNEL_MODULE_DIR"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "[WARN] App '$cmd' missing"
+        return
     fi
 
-    echo "  > Поки йде збірка, користуйся Telegram/терміналом (2–3 хв)..."
-    sleep 150
-    kill_if_exists "$TELEGRAM_CMD"
-    kill_if_exists "$TERMINAL_CMD"
+    echo "[SCENARIO] APP_LOOP: $cmd x $iters"
+
+    for ((i=1; i<=iters; i++)); do
+        echo "  [$cmd] start ($i/$iters)"
+        "$cmd" >/dev/null 2>&1 &
+        local pid=$!
+
+        sleep "$APP_START_SLEEP"
+
+        echo "  [$cmd] stop ($i/$iters)"
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+
+        pkill -f "$cmd" 2>/dev/null || true
+        pkill -f "chrome" 2>/dev/null || true
+
+        sleep "$APP_CLOSE_SLEEP"
+    done
 }
 
-scenario_parallel_io_python() {
-    echo "[SCENARIO] PARALLEL_IO_PYTHON: IO + Python CPU-mix (90s)"
-    dd if=/dev/zero of="$IO_TEST_FILE" bs=16M count=64 oflag=direct 2>/dev/null || true &
-    python3 - << 'EOF' &
-import time, math, random
-data = [random.random() for _ in range(200_000)]
-start = time.time()
-while time.time() - start < 90:
-    s = sum(math.sqrt(x) for x in data)
-    time.sleep(0.03)
-EOF
-    sleep 100
-    rm -f "$IO_TEST_FILE" || true
+scenario_all_apps_open_close() {
+    echo "[SCENARIO] ALL_APPS_OPEN_CLOSE"
+
+    open_close_app_loop "$CMD_BROWSER" "$ITER_APP_OPEN_CLOSE"
+    open_close_app_loop "$CMD_TELEGRAM" "$ITER_APP_OPEN_CLOSE"
+    open_close_app_loop "$CMD_PYCHARM" "$ITER_APP_OPEN_CLOSE"
+    open_close_app_loop "$CMD_CLION" "$ITER_APP_OPEN_CLOSE"
+    open_close_app_loop "$CMD_EASYEFFECTS" "$ITER_APP_OPEN_CLOSE"
+    open_close_app_loop "$CMD_VOLUME_CTRL" "$ITER_APP_OPEN_CLOSE"
+    open_close_app_loop "$CMD_ONLYOFFICE" "$ITER_APP_OPEN_CLOSE"
+    open_close_app_loop "$CMD_THUNAR" "$ITER_APP_OPEN_CLOSE"
+    open_close_app_loop "$CMD_VLC" "$ITER_APP_OPEN_CLOSE"
+    open_close_app_loop "$CMD_OBS" "$ITER_APP_OPEN_CLOSE"
 }
 
-scenario_parallel_multitask_light() {
-    echo "[SCENARIO] PARALLEL_MULTITASK_LIGHT: Browser + Terminal + легке навантаження (2 хв)"
-    run_if_exists "$BROWSER_CMD"
-    run_if_exists "$TERMINAL_CMD"
-    sleep 10
+scenario_mixed_parallel_loop() {
+    echo "[SCENARIO] MIXED_PARALLEL ($ITER_MIXED_PARALLEL)"
+    for ((i=1; i<=ITER_MIXED_PARALLEL; i++)); do
+        echo "  [MIXED] start ($i/$ITER_MIXED_PARALLEL)"
 
-    python3 - << 'EOF'
-import time
-for _ in range(1000000):
-    pass
-time.sleep(120)
+        run_if_exists_bg "$CMD_BROWSER"
+        run_if_exists_bg "$CMD_TELEGRAM"
+        run_if_exists_bg "$CMD_PYCHARM"
+        run_if_exists_bg "$CMD_CLION"
+
+        python3 - << 'EOF' >/dev/null 2>&1 &
+import math, random
+N = 3_000_000
+s = 0.0
+for _ in range(N):
+    s += math.sqrt(random.random())
 EOF
 
-    sleep 120
-    kill_if_exists "$BROWSER_CMD"
-    kill_if_exists "$TERMINAL_CMD"
+        dd if=/dev/zero of="$IO_TEST_FILE" bs=8M count=32 oflag=direct >/dev/null 2>&1 || true &
+
+        sleep 10
+        rm -f "$IO_TEST_FILE" || true
+
+        kill_if_exists "$CMD_BROWSER"
+        kill_if_exists "$CMD_TELEGRAM"
+        kill_if_exists "$CMD_PYCHARM"
+        kill_if_exists "$CMD_CLION"
+
+        echo "  [MIXED] done ($i/$ITER_MIXED_PARALLEL)"
+        sleep "$SHORT_SLEEP"
+    done
 }
 
-scenario_parallel_full_chaos() {
-    echo "[SCENARIO] PARALLEL_FULL_CHAOS: Browser + IDE + Terminal + Telegram (3 хв)"
-    run_if_exists "$BROWSER_CMD"
-    run_if_exists "$IDE_CMD"
-    run_if_exists "$TERMINAL_CMD"
-    run_if_exists "$TELEGRAM_CMD"
-    echo "  > Повноцінний multitasking (поклацай усе підряд 3 хв)..."
-    sleep 180
-    kill_if_exists "$BROWSER_CMD"
-    kill_if_exists "$IDE_CMD"
-    kill_if_exists "$TERMINAL_CMD"
-    kill_if_exists "$TELEGRAM_CMD"
-}
-
-# ============================
-#  ПОСЛІДОВНІСТЬ СЦЕНАРІЇВ
-# ============================
+# ============================================
+# Scenario sequence
+# ============================================
 
 SCENARIO_SEQUENCE=(
-    "scenario_idle_short"
-    "scenario_browser_browsing"
-    "scenario_ide_open_project"
-    "scenario_kernel_build"
-    "scenario_cpu_stress"
-    "scenario_io_stress"
-    "scenario_python_mixed"
-    "scenario_terminal_activity"
-    "scenario_telegram_chat"
-    "scenario_browser_video"
-    "scenario_idle_long"
-    "scenario_cooldown_idle"
-    "scenario_parallel_browsing_ide"
-    "scenario_parallel_cpu_video"
-    "scenario_parallel_build_telegram"
-    "scenario_parallel_io_python"
-    "scenario_parallel_multitask_light"
-    "scenario_parallel_full_chaos"
+    "scenario_kernel_build_loop"
+    "scenario_cpu_python_loop"
+    "scenario_io_dd_loop"
+    "scenario_all_apps_open_close"
+    "scenario_mixed_parallel_loop"
 )
 
-# ============================
-#  ГОЛОВНИЙ ЦИКЛ
-# ============================
+echo "[INFO] scenario_runner.sh started."
+echo "[INFO] adaptive_daemon.py має бути запущений окремо під sudo."
 
-echo "[INFO] Старт сценарійного раннера."
-echo "[INFO] Раундів повної послідовності: $ROUNDS"
-echo "[INFO] Переконайся, що adaptive_daemon.py вже запущено з sudo."
-echo "[INFO] Приблизний час одного раунду: ~40–60 хв (залежить від твоєї активності)."
-
-for (( round=1; round<=ROUNDS; round++ )); do
+for scen in "${SCENARIO_SEQUENCE[@]}"; do
     echo
-    echo "======================================"
-    echo "          ROUND $round / $ROUNDS"
-    echo "======================================"
-    for scen in "${SCENARIO_SEQUENCE[@]}"; do
-        echo
-        echo "---------- RUNNING: $scen ----------"
-        date +"[TIME] %F %T"
-        $scen
-    done
-
-    echo
-    echo "[INFO] Кінець раунду $round. Пауза 60s перед наступним раундом..."
-    sleep 60
+    echo "========== Running: $scen =========="
+    "$scen"
 done
 
-echo "[INFO] Усі раунди сценаріїв завершені."
-echo "[INFO] За цей час adaptive_daemon мав накопичити великий лог у logs/metrics_log.csv"
+echo "[INFO] All scenarios complete. Dataset готовий."
