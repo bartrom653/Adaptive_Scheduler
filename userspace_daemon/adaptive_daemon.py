@@ -21,6 +21,7 @@ PATH_TARGET_PID = SYSFS_BASE / "target_pid"
 
 PROC_STAT = Path("/proc/stat")
 PROC_MEMINFO = Path("/proc/meminfo")
+
 PROC_LOADAVG = Path("/proc/loadavg")
 PROC_PSI_CPU = Path("/proc/pressure/cpu")
 

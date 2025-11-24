@@ -43,6 +43,6 @@ out/
 venv/
 ENV/
 
-#----- Metrics log
-logs
-.csv
+##----- Metrics log
+#logs
+#.csv
