@@ -70,7 +70,7 @@ def main():
     # -----------------------------
     # 5. Save the model
     # -----------------------------
-    out_path = Path("model.pkl")
+    out_path = Path("../model.pkl")
     joblib.dump(model, out_path)
     print(f"\n[INFO] Model saved to: {out_path.resolve()}")
 
