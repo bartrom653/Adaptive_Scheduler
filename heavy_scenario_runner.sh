@@ -20,7 +20,7 @@ ITER_MIXED_HEAVY=6              # mixed heavy iterations per run
 
 # Total number of full runs over all scenarios
 # Increase this value to collect more ML training data.
-TOTAL_RUNS=20
+TOTAL_RUNS=1
 
 # Small pauses between iterations (do NOT change the amount of work,
 # they only give the system a short breather).

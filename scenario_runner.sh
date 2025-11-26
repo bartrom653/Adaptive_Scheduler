@@ -6,7 +6,7 @@ set -euo pipefail
 # ============================================
 
 # Directory with your kernel module (must contain Makefile)
-KERNEL_MODULE_DIR="$HOME/Projects/adaptive_sched/kernel_module"
+KERNEL_MODULE_DIR="$HOME/Projects/adaptive_sched/"
 
 # Temporary file for IO stress
 IO_TEST_FILE="/tmp/adaptive_io_test.bin"
@@ -20,7 +20,7 @@ ITER_MIXED_PARALLEL=6        # how many mixed parallel iterations
 
 # Number of full runs of the entire SCENARIO_SEQUENCE
 # Increase this value to collect a larger ML dataset.
-TOTAL_RUNS=3
+TOTAL_RUNS=1
 
 # Timing parameters
 APP_START_SLEEP=4            # time to let a GUI app start
