@@ -15,11 +15,6 @@ from joblib import load
 MODE = os.environ.get("ADAPTIVE_MODE", "hybrid").lower()
 
 # ----------------------------
-# CPU info
-# ----------------------------
-CPU_COUNT = os.cpu_count() or 1
-
-# ----------------------------
 # Paths to kernel module sysfs interface
 # ----------------------------
 
@@ -196,7 +191,7 @@ def pick_target_pid(min_cpu: float = 5.0) -> Optional[int]:
 
     Strategy:
     - Use 'ps' to list processes sorted by CPU usage.
-    - Ignore system processes and this controller itself.
+    - Ignore system processes and this daemon itself.
     - Return the first process with CPU >= min_cpu.
     """
     try:
@@ -328,9 +323,7 @@ def decide_boost_level(avg_load: int,
                        features: Dict[str, Any]) -> int:
     """
     Rule-based controller using system + process features.
-
-    proc_cpu is normalized by CPU core count to avoid
-    200–300% spikes for multi-threaded processes like IDEs.
+    This is the same base logic as in adaptive_daemon (for compatibility).
     """
     if avg_load is None or max_load is None:
         return 0
@@ -338,24 +331,18 @@ def decide_boost_level(avg_load: int,
     mem_used = features.get("mem_used_pct", 0.0)
     procs_running = features.get("procs_running", 0)
 
-    norm_proc_cpu = None
-    if proc_cpu is not None:
-        norm_proc_cpu = min(100.0, proc_cpu / max(1, CPU_COUNT))
-
-    strong_cpu = norm_proc_cpu is not None and norm_proc_cpu >= 80
-
-    # Strong boost only if both system and process are really busy
-    if (max_load >= 90 and strong_cpu) or \
+    if max_load >= 90 or \
+       (proc_cpu is not None and proc_cpu >= 80) or \
        (mem_used >= 90 and procs_running >= 8):
         return 3
 
     if avg_load >= 70 or \
-       (norm_proc_cpu is not None and norm_proc_cpu >= 60) or \
+       (proc_cpu is not None and proc_cpu >= 60) or \
        (mem_used >= 80 and procs_running >= 6):
         return 2
 
     if avg_load >= 40 or \
-       (norm_proc_cpu is not None and norm_proc_cpu >= 30) or \
+       (proc_cpu is not None and proc_cpu >= 30) or \
        (mem_used >= 70 and procs_running >= 4):
         return 1
 
@@ -383,6 +370,7 @@ def predict_boost_ml(features: Dict[str, Any]) -> int:
     if ML_MODEL is None:
         return 0
 
+    # Use exactly the features the model was trained on
     row = {name: features.get(name, 0) for name in ML_MODEL.feature_names_in_}
     df = pd.DataFrame([row])
     boost = int(ML_MODEL.predict(df)[0])
@@ -408,7 +396,6 @@ def main_loop(interval: float = 0.5):
     print("[INFO] Adaptive controller started")
     print(f"[INFO] Mode: {MODE}")
     print(f"[INFO] Using sysfs base: {SYSFS_BASE}")
-    print(f"[INFO] Detected CPU cores: {CPU_COUNT}")
 
     last_target_pid: Optional[int] = None
     last_boost_level: Optional[int] = None
@@ -452,9 +439,6 @@ def main_loop(interval: float = 0.5):
         if hold_start is None:
             hold_start = now
 
-        # Normalized CPU for logging
-        norm_proc_cpu = min(100.0, proc_cpu / max(1, CPU_COUNT))
-
         # -------------------------
         # Hybrid auto-switching logic (same as in adaptive_daemon)
         # -------------------------
@@ -476,6 +460,7 @@ def main_loop(interval: float = 0.5):
                 high_competition = True
 
         # 3) Time-based condition:
+        #    if we hold the process long, but it is weak, we can switch as well
         time_based_switch = (now - hold_start > HOLD_TIME_SEC and proc_cpu < 5.0)
 
         should_switch = low_cpu_triggered or high_competition or time_based_switch
@@ -483,7 +468,7 @@ def main_loop(interval: float = 0.5):
         if should_switch:
             print(
                 f"[INFO] Auto-switching target pid {last_target_pid} "
-                f"(proc_cpu={proc_cpu:.1f}%, norm_proc_cpu={norm_proc_cpu:.1f}%, "
+                f"(proc_cpu={proc_cpu:.1f}%, "
                 f"low_cpu={low_cpu_triggered}, high_comp={high_competition}, "
                 f"time_based={time_based_switch})"
             )
@@ -506,7 +491,6 @@ def main_loop(interval: float = 0.5):
             "avg_load": avg_load if avg_load is not None else 0,
             "max_load": max_load if max_load is not None else 0,
             "proc_cpu": proc_cpu,
-            "norm_proc_cpu": norm_proc_cpu,
             "target_pid": last_target_pid,
         }
         all_features.update(sys_features)
@@ -546,7 +530,6 @@ def main_loop(interval: float = 0.5):
                     f"avg={all_features['avg_load']}%, "
                     f"max={all_features['max_load']}%, "
                     f"proc_cpu={proc_cpu:.1f}%, "
-                    f"norm_proc_cpu={norm_proc_cpu:.1f}%, "
                     f"mem_used={all_features.get('mem_used_pct', 0):.1f}%, "
                     f"procs_running={all_features.get('procs_running', 0)}, "
                     f"pid={last_target_pid})"
@@ -557,7 +540,6 @@ def main_loop(interval: float = 0.5):
                 f"avg={all_features['avg_load']}%, "
                 f"max={all_features['max_load']}%, "
                 f"proc_cpu={proc_cpu:.1f}%, "
-                f"norm_proc_cpu={norm_proc_cpu:.1f}%, "
                 f"mem_used={all_features.get('mem_used_pct', 0):.1f}%, "
                 f"procs_running={all_features.get('procs_running', 0)}, "
                 f"pid={last_target_pid}"
